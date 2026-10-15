@@ -40,6 +40,13 @@ jobs:
           Get-Content bad.txt
           if ($bad.ExitCode -ne 2) { throw "an unknown code exited with $($bad.ExitCode), expected 2" }
 
+      - name: Try read-only and radio options (for the log; runners have no screen, sound or Bluetooth)
+        shell: pwsh
+        run: |
+          $run = Start-Process .\DigitControl.exe -ArgumentList '91 92 93 94 71' -Wait -PassThru -RedirectStandardOutput info.txt
+          Get-Content info.txt
+          "exit code $($run.ExitCode)"
+
       - uses: actions/upload-artifact@v4
         with:
           name: DigitControl

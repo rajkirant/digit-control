@@ -30,7 +30,6 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
-using Windows.Devices.Radios;
 
 namespace DigitControl
 {
@@ -108,12 +107,12 @@ namespace DigitControl
             Act(68, "Open", "Control Panel", r => Apps.Open("control.exe", "", "Control Panel")),
             Act(69, "Open", "Device Manager", r => Apps.Open("devmgmt.msc", "", "Device Manager")),
 
-            Act(71, "Wireless", "Bluetooth on", r => Radios.Set(RadioKind.Bluetooth, "Bluetooth", true)),
-            Act(72, "Wireless", "Bluetooth off", r => Radios.Set(RadioKind.Bluetooth, "Bluetooth", false)),
-            Act(73, "Wireless", "Bluetooth on / off", r => Radios.Set(RadioKind.Bluetooth, "Bluetooth", null)),
-            Act(74, "Wireless", "Wi-Fi on", r => Radios.Set(RadioKind.WiFi, "Wi-Fi", true)),
-            Act(75, "Wireless", "Wi-Fi off", r => Radios.Set(RadioKind.WiFi, "Wi-Fi", false)),
-            Act(76, "Wireless", "Wi-Fi on / off", r => Radios.Set(RadioKind.WiFi, "Wi-Fi", null)),
+            Act(71, "Wireless", "Bluetooth on", r => Radios.Set("Bluetooth", "Bluetooth", true)),
+            Act(72, "Wireless", "Bluetooth off", r => Radios.Set("Bluetooth", "Bluetooth", false)),
+            Act(73, "Wireless", "Bluetooth on / off", r => Radios.Set("Bluetooth", "Bluetooth", null)),
+            Act(74, "Wireless", "Wi-Fi on", r => Radios.Set("WiFi", "Wi-Fi", true)),
+            Act(75, "Wireless", "Wi-Fi off", r => Radios.Set("WiFi", "Wi-Fi", false)),
+            Act(76, "Wireless", "Wi-Fi on / off", r => Radios.Set("WiFi", "Wi-Fi", null)),
             Act(77, "Wireless", "Bluetooth settings", r => Apps.Open("ms-settings:bluetooth", "", "Bluetooth settings")),
             Act(78, "Wireless", "Wi-Fi settings", r => Apps.Open("ms-settings:network-wifi", "", "Wi-Fi settings")),
             Act(79, "Wireless", "Airplane mode settings", r => Apps.Open("ms-settings:network-airplanemode", "", "Airplane mode settings")),
@@ -690,12 +689,20 @@ namespace DigitControl
     }
 
     // Bluetooth and Wi-Fi, through the same Windows API as the buttons in
-    // Quick Settings. It turns the radio on or off; paired devices stay
-    // paired and reconnect when it comes back on.
+    // Quick Settings (Windows.Devices.Radios). It turns the radio on or off;
+    // paired devices stay paired and reconnect when it comes back on.
+    //
+    // The API belongs to the Windows Runtime. The compiler that ships with
+    // Windows can't reference it without the Windows SDK, so it is reached
+    // through reflection, the same way PowerShell scripts do it.
     static class Radios
     {
-        // true turns it on, false off, null switches
-        public static string Set(RadioKind kind, string name, bool? on)
+        const string WinRT = ", Windows.System.Devices, ContentType=WindowsRuntime";
+        const string Extensions = "System.WindowsRuntimeSystemExtensions, System.Runtime.WindowsRuntime, " +
+                                  "Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089";
+
+        // kind is "Bluetooth" or "WiFi"; true turns it on, false off, null switches
+        public static string Set(string kind, string name, bool? on)
         {
             // The calls are asynchronous; they run on a worker thread and the
             // window waits a moment for the answer
@@ -706,29 +713,70 @@ namespace DigitControl
             }
             catch (AggregateException e)
             {
-                throw e.InnerException;
+                throw Unwrap(e);
             }
         }
 
-        static string SetAndWait(RadioKind kind, string name, bool? on)
+        static string SetAndWait(string kind, string name, bool? on)
         {
-            if (Radio.RequestAccessAsync().AsTask().Result != RadioAccessStatus.Allowed)
+            Type radioType = Type.GetType("Windows.Devices.Radios.Radio" + WinRT, true);
+            Type accessType = Type.GetType("Windows.Devices.Radios.RadioAccessStatus" + WinRT, true);
+            Type stateType = Type.GetType("Windows.Devices.Radios.RadioState" + WinRT, true);
+
+            object access = Await(radioType.GetMethod("RequestAccessAsync").Invoke(null, null), accessType);
+            if (access.ToString() != "Allowed")
                 throw new Problem("Windows didn't allow it. Check Settings > Privacy & security > Radios.");
 
-            var found = new List<Radio>();
-            foreach (Radio radio in Radio.GetRadiosAsync().AsTask().Result)
-                if (radio.Kind == kind) found.Add(radio);
+            Type listType = typeof(IReadOnlyList<>).MakeGenericType(radioType);
+            var radios = (System.Collections.IEnumerable)Await(radioType.GetMethod("GetRadiosAsync").Invoke(null, null), listType);
+            PropertyInfo kindProperty = radioType.GetProperty("Kind");
+            PropertyInfo stateProperty = radioType.GetProperty("State");
+
+            var found = new List<object>();
+            foreach (object radio in radios)
+                if (kindProperty.GetValue(radio, null).ToString() == kind) found.Add(radio);
             if (found.Count == 0)
                 throw new Problem("no " + name + " adapter found. It may be missing or disabled in Device Manager.");
 
-            bool want = on.HasValue ? on.Value : found[0].State != RadioState.On;
-            foreach (Radio radio in found)
+            bool want = on.HasValue ? on.Value : stateProperty.GetValue(found[0], null).ToString() != "On";
+            object state = Enum.Parse(stateType, want ? "On" : "Off");
+            MethodInfo setState = radioType.GetMethod("SetStateAsync");
+            foreach (object radio in found)
             {
-                if ((radio.State == RadioState.On) == want) continue;
-                if (radio.SetStateAsync(want ? RadioState.On : RadioState.Off).AsTask().Result != RadioAccessStatus.Allowed)
+                if ((stateProperty.GetValue(radio, null).ToString() == "On") == want) continue;
+                object result = Await(setState.Invoke(radio, new[] { state }), accessType);
+                if (result.ToString() != "Allowed")
                     throw new Problem("Windows refused to turn it " + (want ? "on." : "off."));
             }
             return name + ": " + (want ? "on" : "off");
+        }
+
+        // Waits for an IAsyncOperation<resultType> through AsTask
+        static object Await(object operation, Type resultType)
+        {
+            MethodInfo asTask = null;
+            foreach (MethodInfo method in Type.GetType(Extensions, true).GetMethods())
+            {
+                ParameterInfo[] parameters = method.GetParameters();
+                if (method.Name == "AsTask" && parameters.Length == 1 &&
+                    parameters[0].ParameterType.Name == "IAsyncOperation`1")
+                {
+                    asTask = method.MakeGenericMethod(resultType);
+                    break;
+                }
+            }
+            if (asTask == null) throw new Problem("this version of Windows has no radio API.");
+
+            var task = (Task)asTask.Invoke(null, new[] { operation });
+            if (!task.Wait(15000)) throw new Problem("Windows took too long to answer.");
+            return task.GetType().GetProperty("Result").GetValue(task, null);
+        }
+
+        static Exception Unwrap(Exception e)
+        {
+            while ((e is AggregateException || e is TargetInvocationException) && e.InnerException != null)
+                e = e.InnerException;
+            return e;
         }
     }
 

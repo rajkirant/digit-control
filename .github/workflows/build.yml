@@ -36,7 +36,7 @@ jobs:
           Get-Content list.txt
           if ($list.ExitCode -ne 0) { throw "--list exited with $($list.ExitCode)" }
           if (-not (Select-String -Path list.txt -Pattern '11  Brightness up 1%' -Quiet)) { throw '--list did not print the options' }
-          $bad = Start-Process .\DigitControl.exe -ArgumentList '99' -Wait -PassThru -RedirectStandardOutput bad.txt
+          $bad = Start-Process .\DigitControl.exe -ArgumentList '10' -Wait -PassThru -RedirectStandardOutput bad.txt
           Get-Content bad.txt
           if ($bad.ExitCode -ne 2) { throw "an unknown code exited with $($bad.ExitCode), expected 2" }
 

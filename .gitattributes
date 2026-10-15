@@ -1,0 +1,2 @@
+# Windows batch files run under cmd, which wants CRLF
+*.bat text eol=crlf

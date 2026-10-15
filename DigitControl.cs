@@ -4,6 +4,7 @@
 //
 //   1x  display      2x  sound      3x  media
 //   4x  appearance   5x  power      6x  open an app
+//   7x  wireless     8x  screens    9x  tools
 //
 // Type codes into the window and press Enter ("11 11 21", or "111121"
 // since every code is two digits), add "x5" to repeat a code five times
@@ -19,12 +20,17 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
 using System.Management;
+using System.Net;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
+using Windows.Devices.Radios;
 
 namespace DigitControl
 {
@@ -44,7 +50,11 @@ namespace DigitControl
 
     static class Options
     {
-        public static readonly string[] Groups = { "Display", "Sound", "Media", "Appearance", "Power", "Open" };
+        public static readonly string[] Groups =
+        {
+            "Display", "Sound", "Media", "Appearance", "Power",
+            "Open", "Wireless", "Screens", "Tools",
+        };
 
         // To add an option, add a line here with an unused code; the window,
         // the command line's --list and the parser all read this table.
@@ -67,6 +77,7 @@ namespace DigitControl
             Act(26, "Sound", "Mute", r => Volume.SetMute(true)),
             Act(27, "Sound", "Unmute", r => Volume.SetMute(false)),
             Act(28, "Sound", "Mute / unmute", r => Volume.SetMute(null)),
+            Act(29, "Sound", "Volume mixer", r => Apps.Open("sndvol.exe", "", "Volume mixer")),
 
             Act(31, "Media", "Play / pause", r => Media.Press(Media.PlayPause, "Play / pause")),
             Act(32, "Media", "Next track", r => Media.Press(Media.Next, "Next track")),
@@ -82,14 +93,48 @@ namespace DigitControl
             Act(52, "Power", "Keep awake off", r => Power.KeepAwake(r, false)),
             Act(53, "Power", "Lock the PC", r => Power.Lock()),
             Act(54, "Power", "Sleep", Power.Sleep),
+            Act(55, "Power", "Hibernate", Power.Hibernate),
+            Act(56, "Power", "Restart in 60 seconds", r => Power.Shutdown("/r /t 60", "Restarting in 60 seconds. Type 58 to cancel.")),
+            Act(57, "Power", "Shut down in 60 seconds", r => Power.Shutdown("/s /t 60", "Shutting down in 60 seconds. Type 58 to cancel.")),
+            Act(58, "Power", "Cancel restart / shut down", r => Power.Shutdown("/a", "Restart / shut down: cancelled")),
 
-            Act(61, "Open", "Task Manager", r => Apps.Open("taskmgr.exe", "Task Manager")),
-            Act(62, "Open", "Settings", r => Apps.Open("ms-settings:", "Settings")),
-            Act(63, "Open", "File Explorer", r => Apps.Open("explorer.exe", "File Explorer")),
-            Act(64, "Open", "Calculator", r => Apps.Open("calc.exe", "Calculator")),
-            Act(65, "Open", "Screenshot (snip)", r => Apps.Open("ms-screenclip:", "Screenshot")),
-            Act(66, "Open", "Notepad", r => Apps.Open("notepad.exe", "Notepad")),
-            Act(67, "Open", "Command Prompt", r => Apps.Open("cmd.exe", "Command Prompt")),
+            Act(61, "Open", "Task Manager", r => Apps.Open("taskmgr.exe", "", "Task Manager")),
+            Act(62, "Open", "Settings", r => Apps.Open("ms-settings:", "", "Settings")),
+            Act(63, "Open", "File Explorer", r => Apps.Open("explorer.exe", "", "File Explorer")),
+            Act(64, "Open", "Calculator", r => Apps.Open("calc.exe", "", "Calculator")),
+            Act(65, "Open", "Screenshot (snip)", r => Apps.Open("ms-screenclip:", "", "Screenshot")),
+            Act(66, "Open", "Notepad", r => Apps.Open("notepad.exe", "", "Notepad")),
+            Act(67, "Open", "Command Prompt", r => Apps.Open("cmd.exe", "", "Command Prompt")),
+            Act(68, "Open", "Control Panel", r => Apps.Open("control.exe", "", "Control Panel")),
+            Act(69, "Open", "Device Manager", r => Apps.Open("devmgmt.msc", "", "Device Manager")),
+
+            Act(71, "Wireless", "Bluetooth on", r => Radios.Set(RadioKind.Bluetooth, "Bluetooth", true)),
+            Act(72, "Wireless", "Bluetooth off", r => Radios.Set(RadioKind.Bluetooth, "Bluetooth", false)),
+            Act(73, "Wireless", "Bluetooth on / off", r => Radios.Set(RadioKind.Bluetooth, "Bluetooth", null)),
+            Act(74, "Wireless", "Wi-Fi on", r => Radios.Set(RadioKind.WiFi, "Wi-Fi", true)),
+            Act(75, "Wireless", "Wi-Fi off", r => Radios.Set(RadioKind.WiFi, "Wi-Fi", false)),
+            Act(76, "Wireless", "Wi-Fi on / off", r => Radios.Set(RadioKind.WiFi, "Wi-Fi", null)),
+            Act(77, "Wireless", "Bluetooth settings", r => Apps.Open("ms-settings:bluetooth", "", "Bluetooth settings")),
+            Act(78, "Wireless", "Wi-Fi settings", r => Apps.Open("ms-settings:network-wifi", "", "Wi-Fi settings")),
+            Act(79, "Wireless", "Airplane mode settings", r => Apps.Open("ms-settings:network-airplanemode", "", "Airplane mode settings")),
+
+            Act(81, "Screens", "This PC's screen only", r => Screens.Project("/internal", "this PC's screen only")),
+            Act(82, "Screens", "Duplicate screens", r => Screens.Project("/clone", "duplicated")),
+            Act(83, "Screens", "Extend screens", r => Screens.Project("/extend", "extended")),
+            Act(84, "Screens", "Second screen only", r => Screens.Project("/external", "second screen only")),
+            Act(85, "Screens", "Display settings", r => Apps.Open("ms-settings:display", "", "Display settings")),
+            Act(86, "Screens", "Night light settings", r => Apps.Open("ms-settings:nightlight", "", "Night light settings")),
+            Act(87, "Screens", "Wallpaper settings", r => Apps.Open("ms-settings:personalization-background", "", "Wallpaper settings")),
+
+            Act(91, "Tools", "Battery status", r => Info.Battery()),
+            Act(92, "Tools", "Time since start-up", r => Info.Uptime()),
+            Act(93, "Tools", "Free disk space", r => Info.Disk()),
+            Act(94, "Tools", "IP address (local)", r => Info.IpAddress()),
+            Act(95, "Tools", "Clear the clipboard", r => Tools.ClearClipboard()),
+            Act(96, "Tools", "Empty the Recycle Bin", r => Tools.EmptyRecycleBin()),
+            Act(97, "Tools", "Open Downloads", r => Apps.Open("explorer.exe", "shell:Downloads", "Downloads")),
+            Act(98, "Tools", "Open Documents", r => Apps.Open("explorer.exe", "shell:Personal", "Documents")),
+            Act(99, "Tools", "Restart Explorer", r => Tools.RestartExplorer()),
         };
 
         public static Option Find(int code)
@@ -625,11 +670,176 @@ namespace DigitControl
 
     static class Apps
     {
-        public static string Open(string target, string name)
+        public static string Open(string target, string arguments, string name)
         {
-            Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+            Process.Start(new ProcessStartInfo(target, arguments) { UseShellExecute = true });
             return "Opened " + name;
         }
+
+        // Runs a Windows command-line tool without a console window and
+        // returns its exit code
+        public static int RunHidden(string file, string arguments)
+        {
+            var start = new ProcessStartInfo(file, arguments) { UseShellExecute = false, CreateNoWindow = true };
+            using (Process process = Process.Start(start))
+            {
+                if (!process.WaitForExit(10000)) throw new Problem(file + " did not finish.");
+                return process.ExitCode;
+            }
+        }
+    }
+
+    // Bluetooth and Wi-Fi, through the same Windows API as the buttons in
+    // Quick Settings. It turns the radio on or off; paired devices stay
+    // paired and reconnect when it comes back on.
+    static class Radios
+    {
+        // true turns it on, false off, null switches
+        public static string Set(RadioKind kind, string name, bool? on)
+        {
+            // The calls are asynchronous; they run on a worker thread and the
+            // window waits a moment for the answer
+            Task<string> work = Task.Run(() => SetAndWait(kind, name, on));
+            try
+            {
+                return work.Result;
+            }
+            catch (AggregateException e)
+            {
+                throw e.InnerException;
+            }
+        }
+
+        static string SetAndWait(RadioKind kind, string name, bool? on)
+        {
+            if (Radio.RequestAccessAsync().AsTask().Result != RadioAccessStatus.Allowed)
+                throw new Problem("Windows didn't allow it. Check Settings > Privacy & security > Radios.");
+
+            var found = new List<Radio>();
+            foreach (Radio radio in Radio.GetRadiosAsync().AsTask().Result)
+                if (radio.Kind == kind) found.Add(radio);
+            if (found.Count == 0)
+                throw new Problem("no " + name + " adapter found. It may be missing or disabled in Device Manager.");
+
+            bool want = on.HasValue ? on.Value : found[0].State != RadioState.On;
+            foreach (Radio radio in found)
+            {
+                if ((radio.State == RadioState.On) == want) continue;
+                if (radio.SetStateAsync(want ? RadioState.On : RadioState.Off).AsTask().Result != RadioAccessStatus.Allowed)
+                    throw new Problem("Windows refused to turn it " + (want ? "on." : "off."));
+            }
+            return name + ": " + (want ? "on" : "off");
+        }
+    }
+
+    // Project mode, the same choices as Windows + P
+    static class Screens
+    {
+        public static string Project(string mode, string name)
+        {
+            Process.Start(new ProcessStartInfo("DisplaySwitch.exe", mode) { UseShellExecute = true });
+            return "Screens: " + name;
+        }
+    }
+
+    // Options that only report something
+    static class Info
+    {
+        public static string Battery()
+        {
+            PowerStatus power = SystemInformation.PowerStatus;
+            if ((power.BatteryChargeStatus & BatteryChargeStatus.NoSystemBattery) != 0)
+                return "Battery: none, this PC runs on mains power";
+            if (power.BatteryLifePercent > 1)
+                throw new Problem("Windows doesn't know the battery level right now.");
+
+            string line = "Battery: " + (int)Math.Round(power.BatteryLifePercent * 100) + "%";
+            if ((power.BatteryChargeStatus & BatteryChargeStatus.Charging) != 0) line += ", charging";
+            else if (power.PowerLineStatus == PowerLineStatus.Online) line += ", plugged in";
+            else if (power.BatteryLifeRemaining > 0) line += ", about " + Duration(TimeSpan.FromSeconds(power.BatteryLifeRemaining)) + " left";
+            return line;
+        }
+
+        public static string Uptime()
+        {
+            return "Time since start-up: " + Duration(TimeSpan.FromMilliseconds(GetTickCount64()));
+        }
+
+        public static string Disk()
+        {
+            var drive = new DriveInfo(Path.GetPathRoot(Environment.SystemDirectory));
+            const double GB = 1024.0 * 1024 * 1024;
+            return "Disk " + drive.Name.TrimEnd('\\') + " " + Math.Round(drive.AvailableFreeSpace / GB) + " GB free of " +
+                   Math.Round(drive.TotalSize / GB) + " GB";
+        }
+
+        public static string IpAddress()
+        {
+            var found = new List<string>();
+            foreach (IPAddress address in Dns.GetHostAddresses(Dns.GetHostName()))
+                if (address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(address))
+                    found.Add(address.ToString());
+            if (found.Count == 0) throw new Problem("not connected to a network.");
+            return "IP address (local): " + string.Join(", ", found);
+        }
+
+        static string Duration(TimeSpan span)
+        {
+            var parts = new List<string>();
+            if (span.Days > 0) parts.Add(span.Days + (span.Days == 1 ? " day" : " days"));
+            if (span.Hours > 0) parts.Add(span.Hours + (span.Hours == 1 ? " hour" : " hours"));
+            if (span.Days == 0) parts.Add(span.Minutes + (span.Minutes == 1 ? " minute" : " minutes"));
+            return string.Join(" ", parts);
+        }
+
+        [DllImport("kernel32.dll")]
+        static extern ulong GetTickCount64();
+    }
+
+    static class Tools
+    {
+        public static string ClearClipboard()
+        {
+            Clipboard.Clear();
+            return "Clipboard: cleared";
+        }
+
+        // Windows asks to confirm first, as it does from the desktop
+        public static string EmptyRecycleBin()
+        {
+            return SHEmptyRecycleBin(IntPtr.Zero, null, 0) == 0
+                ? "Recycle Bin: emptied"
+                : "Recycle Bin: already empty, or you chose not to empty it";
+        }
+
+        // Restarts the taskbar, Start menu and desktop, which fixes most
+        // cases of them freezing or drawing wrongly
+        public static string RestartExplorer()
+        {
+            foreach (Process explorer in Process.GetProcessesByName("explorer"))
+            {
+                try
+                {
+                    explorer.Kill();
+                    explorer.WaitForExit(3000);
+                }
+                catch (Exception)
+                {
+                    // Another user's Explorer, or already gone
+                }
+                finally
+                {
+                    explorer.Dispose();
+                }
+            }
+            // Windows usually starts it again by itself; start it if not
+            System.Threading.Thread.Sleep(1500);
+            if (Process.GetProcessesByName("explorer").Length == 0) Process.Start("explorer.exe");
+            return "Explorer: restarted";
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        static extern int SHEmptyRecycleBin(IntPtr hwnd, string rootPath, uint flags);
     }
 
     static class Power
@@ -681,6 +891,26 @@ namespace DigitControl
         {
             runner.Later.Add(delegate { Application.SetSuspendState(PowerState.Suspend, false, false); });
             return "Going to sleep";
+        }
+
+        public static string Hibernate(Runner runner)
+        {
+            runner.Later.Add(delegate
+            {
+                if (!Application.SetSuspendState(PowerState.Hibernate, false, false))
+                    throw new Problem("Hibernate is turned off on this PC. Turn it on with: powercfg /hibernate on");
+            });
+            return "Hibernating";
+        }
+
+        // Restart and shut down always give 60 seconds to cancel (code 58)
+        public static string Shutdown(string arguments, string line)
+        {
+            int code = Apps.RunHidden("shutdown.exe", arguments);
+            if (code == 1116) throw new Problem("nothing was scheduled to cancel.");
+            if (code == 1190) throw new Problem("a restart or shut down is already scheduled. Type 58 to cancel it.");
+            if (code != 0) throw new Problem("Windows refused (shutdown.exe error " + code + ").");
+            return line;
         }
 
         const uint ES_CONTINUOUS = 0x80000000;
@@ -745,7 +975,7 @@ namespace DigitControl
                 Margin = new Padding(0, 0, 0, 8),
             });
 
-            var groups = new TableLayoutPanel { ColumnCount = 3, AutoSize = true, Margin = new Padding(0) };
+            var groups = new TableLayoutPanel { ColumnCount = 5, AutoSize = true, Margin = new Padding(0) };
             foreach (string group in Options.Groups)
                 groups.Controls.Add(GroupPanel(group));
             layout.Controls.Add(groups);
@@ -760,7 +990,7 @@ namespace DigitControl
             layout.Controls.Add(row);
 
             status.AutoSize = true;
-            status.MaximumSize = new Size(600, 0);
+            status.MaximumSize = new Size(760, 0);
             status.Margin = new Padding(0, 12, 0, 0);
             layout.Controls.Add(status);
 

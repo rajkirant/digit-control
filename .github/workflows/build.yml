@@ -1,0 +1,47 @@
+name: Build
+
+# Every push and pull request builds DigitControl.exe on Windows and checks
+# that it starts. Pushing a tag like v1.2.0 also publishes a release with
+# the .exe attached, so people can download it without building.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: cmd
+        run: build.bat
+
+      - name: Check it starts and reads codes
+        shell: pwsh
+        run: |
+          $list = Start-Process .\DigitControl.exe -ArgumentList '--list' -Wait -PassThru -RedirectStandardOutput list.txt
+          Get-Content list.txt
+          if ($list.ExitCode -ne 0) { throw "--list exited with $($list.ExitCode)" }
+          if (-not (Select-String -Path list.txt -Pattern '11  Brightness up 1%' -Quiet)) { throw '--list did not print the options' }
+          $bad = Start-Process .\DigitControl.exe -ArgumentList '99' -Wait -PassThru -RedirectStandardOutput bad.txt
+          Get-Content bad.txt
+          if ($bad.ExitCode -ne 2) { throw "an unknown code exited with $($bad.ExitCode), expected 2" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DigitControl
+          path: DigitControl.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" DigitControl.exe --title "Digit Control $GITHUB_REF_NAME" --generate-notes

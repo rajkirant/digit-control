@@ -1,15 +1,15 @@
-// Digit Control: a small Windows window with one textbox. Type digits and
-// press Enter; each digit is one option, and they are applied together:
+// Digit Control: control Windows by typing short number codes.
 //
-//   1  brightness up 1%        0  brightness down 1%
-//   2  volume up 1%            3  volume down 1%
-//   4  mute / unmute           5  play / pause music or video
-//   6  dark mode on / off      7  keep the PC awake on / off
-//   8  turn the screen off     9  lock the PC
+// Every option has its own two-digit code, grouped by its first digit:
 //
-// Steps add up ("111" is +3%), on / off options flip each time they appear
-// ("44" leaves the sound as it was), and 8 and 9 happen once however often
-// they are typed.
+//   1x  display      2x  sound      3x  media
+//   4x  appearance   5x  power      6x  open an app
+//
+// Type codes into the window and press Enter ("11 11 21", or "111121"
+// since every code is two digits), add "x5" to repeat a code five times
+// ("11x5"), or pass the same codes on the command line:
+//
+//   DigitControl.exe 11x5 21
 //
 // Build with build.bat, which uses the C# compiler that ships with Windows.
 // That compiler only knows C# 5, so this file avoids anything newer
@@ -17,64 +17,240 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Management;
+using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
 namespace DigitControl
 {
-    // What all the digits of one input add up to, applied once at the end
-    class Changes
-    {
-        public int BrightnessDelta;
-        public int VolumeDelta;
-        public bool ToggleMute;
-        public bool PlayPause;
-        public bool ToggleDarkMode;
-        public bool ToggleKeepAwake;
-        public bool ScreenOff;
-        public bool Lock;
-    }
+    // Options that move a level are merged when they follow each other, so
+    // "11x50" reads and sets the brightness once instead of fifty times
+    enum Level { None, Brightness, Volume }
 
     class Option
     {
-        public readonly char Key;
-        public readonly string Description;
-        public readonly Action<Changes> Apply;
-
-        public Option(char key, string description, Action<Changes> apply)
-        {
-            Key = key;
-            Description = description;
-            Apply = apply;
-        }
+        public int Code;
+        public string Group;
+        public string Description;
+        public Level Level;
+        public Func<int, int> Adjust;   // for Level options: old percent to new percent
+        public Func<Runner, string> Run; // for the rest: does it, returns one line
     }
 
     static class Options
     {
-        // To add an option, add a line here, a field to Changes and a step to
-        // MainForm.Apply. The window lists this table two options to a row.
+        public static readonly string[] Groups = { "Display", "Sound", "Media", "Appearance", "Power", "Open" };
+
+        // To add an option, add a line here with an unused code; the window,
+        // the command line's --list and the parser all read this table.
         public static readonly Option[] All =
         {
-            new Option('1', "Brightness up 1%", c => c.BrightnessDelta += 1),
-            new Option('0', "Brightness down 1%", c => c.BrightnessDelta -= 1),
-            new Option('2', "Volume up 1%", c => c.VolumeDelta += 1),
-            new Option('3', "Volume down 1%", c => c.VolumeDelta -= 1),
-            new Option('4', "Mute / unmute", c => c.ToggleMute = !c.ToggleMute),
-            new Option('5', "Play / pause", c => c.PlayPause = !c.PlayPause),
-            new Option('6', "Dark mode on / off", c => c.ToggleDarkMode = !c.ToggleDarkMode),
-            new Option('7', "Keep awake on / off", c => c.ToggleKeepAwake = !c.ToggleKeepAwake),
-            new Option('8', "Turn the screen off", c => c.ScreenOff = true),
-            new Option('9', "Lock the PC", c => c.Lock = true),
+            Step(11, "Display", "Brightness up 1%", Level.Brightness, b => b + 1),
+            Step(12, "Display", "Brightness down 1%", Level.Brightness, b => b - 1),
+            Step(13, "Display", "Brightness up 10%", Level.Brightness, b => b + 10),
+            Step(14, "Display", "Brightness down 10%", Level.Brightness, b => b - 10),
+            Step(15, "Display", "Brightness 100%", Level.Brightness, b => 100),
+            Step(16, "Display", "Brightness 50%", Level.Brightness, b => 50),
+            Step(17, "Display", "Brightness 0%", Level.Brightness, b => 0),
+            Act(18, "Display", "Turn the screen off", Power.ScreenOff),
+
+            Step(21, "Sound", "Volume up 1%", Level.Volume, v => v + 1),
+            Step(22, "Sound", "Volume down 1%", Level.Volume, v => v - 1),
+            Step(23, "Sound", "Volume up 10%", Level.Volume, v => v + 10),
+            Step(24, "Sound", "Volume down 10%", Level.Volume, v => v - 10),
+            Step(25, "Sound", "Volume 50%", Level.Volume, v => 50),
+            Act(26, "Sound", "Mute", r => Volume.SetMute(true)),
+            Act(27, "Sound", "Unmute", r => Volume.SetMute(false)),
+            Act(28, "Sound", "Mute / unmute", r => Volume.SetMute(null)),
+
+            Act(31, "Media", "Play / pause", r => Media.Press(Media.PlayPause, "Play / pause")),
+            Act(32, "Media", "Next track", r => Media.Press(Media.Next, "Next track")),
+            Act(33, "Media", "Previous track", r => Media.Press(Media.Previous, "Previous track")),
+            Act(34, "Media", "Stop", r => Media.Press(Media.Stop, "Stop")),
+
+            Act(41, "Appearance", "Dark mode", r => Theme.Set(true)),
+            Act(42, "Appearance", "Light mode", r => Theme.Set(false)),
+            Act(43, "Appearance", "Switch dark / light", r => Theme.Toggle()),
+            Act(44, "Appearance", "Show desktop / restore", r => Desktop.Toggle()),
+
+            Act(51, "Power", "Keep awake on", r => Power.KeepAwake(r, true)),
+            Act(52, "Power", "Keep awake off", r => Power.KeepAwake(r, false)),
+            Act(53, "Power", "Lock the PC", r => Power.Lock()),
+            Act(54, "Power", "Sleep", Power.Sleep),
+
+            Act(61, "Open", "Task Manager", r => Apps.Open("taskmgr.exe", "Task Manager")),
+            Act(62, "Open", "Settings", r => Apps.Open("ms-settings:", "Settings")),
+            Act(63, "Open", "File Explorer", r => Apps.Open("explorer.exe", "File Explorer")),
+            Act(64, "Open", "Calculator", r => Apps.Open("calc.exe", "Calculator")),
+            Act(65, "Open", "Screenshot (snip)", r => Apps.Open("ms-screenclip:", "Screenshot")),
+            Act(66, "Open", "Notepad", r => Apps.Open("notepad.exe", "Notepad")),
+            Act(67, "Open", "Command Prompt", r => Apps.Open("cmd.exe", "Command Prompt")),
         };
 
-        public static Option Find(char key)
+        public static Option Find(int code)
         {
             foreach (Option option in All)
-                if (option.Key == key) return option;
+                if (option.Code == code) return option;
             return null;
+        }
+
+        static Option Step(int code, string group, string description, Level level, Func<int, int> adjust)
+        {
+            return new Option { Code = code, Group = group, Description = description, Level = level, Adjust = adjust };
+        }
+
+        static Option Act(int code, string group, string description, Func<Runner, string> run)
+        {
+            return new Option { Code = code, Group = group, Description = description, Run = run };
+        }
+    }
+
+    // Turns typed text into the options to run, in order
+    static class Parser
+    {
+        const int MaxRepeat = 100;
+
+        public static List<Option> Parse(string input, out string error)
+        {
+            var steps = new List<Option>();
+            var unknown = new List<string>();
+            error = null;
+
+            foreach (string token in input.Split(new[] { ' ', ',', ';', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                Match match = Regex.Match(token, @"^(\d+)(?:[xX*](\d+))?$");
+                if (!match.Success)
+                {
+                    error = "\"" + token + "\" isn't a code. Codes are two digits, like 11 or 21; add x5 to repeat one five times.";
+                    return null;
+                }
+                string digits = match.Groups[1].Value;
+                if (digits.Length % 2 != 0)
+                {
+                    error = "\"" + token + "\" has an odd number of digits. Every code is two digits, like 11 or 21.";
+                    return null;
+                }
+                int repeat = 1;
+                if (match.Groups[2].Success && (!int.TryParse(match.Groups[2].Value, out repeat) || repeat < 1 || repeat > MaxRepeat))
+                {
+                    error = "\"" + token + "\": repeat a code between 1 and " + MaxRepeat + " times.";
+                    return null;
+                }
+
+                for (int i = 0; i < digits.Length; i += 2)
+                {
+                    string code = digits.Substring(i, 2);
+                    Option option = Options.Find(int.Parse(code));
+                    if (option == null)
+                    {
+                        if (!unknown.Contains(code)) unknown.Add(code);
+                        continue;
+                    }
+                    // A repeat count belongs to the code just before it
+                    int times = i == digits.Length - 2 ? repeat : 1;
+                    for (int t = 0; t < times; t++) steps.Add(option);
+                }
+            }
+
+            if (unknown.Count > 0)
+            {
+                error = "No option has the code " + string.Join(", ", unknown) + ". Nothing was changed.";
+                return null;
+            }
+            if (steps.Count == 0)
+            {
+                error = "Type at least one code, like 11.";
+                return null;
+            }
+            return steps;
+        }
+    }
+
+    // A friendly failure: its message is shown as it is
+    class Problem : Exception
+    {
+        public Problem(string message) : base(message) { }
+    }
+
+    // One run of a list of options: what it reports, and what is left to do
+    // a moment later (screen off and sleep wait, so letting go of Enter or
+    // the mouse does not undo them)
+    class Runner
+    {
+        public bool InWindow;
+        public bool Failed;
+        public readonly List<string> Lines = new List<string>();
+        public readonly List<Action> Later = new List<Action>();
+    }
+
+    static class Engine
+    {
+        public static Runner Run(List<Option> steps, bool inWindow)
+        {
+            var runner = new Runner { InWindow = inWindow };
+            int i = 0;
+            while (i < steps.Count)
+            {
+                Option option = steps[i];
+                if (option.Level == Level.None)
+                {
+                    Guard(runner, option.Description, delegate { runner.Lines.Add(option.Run(runner)); });
+                    i++;
+                    continue;
+                }
+
+                Func<int, int> adjust = x => x;
+                while (i < steps.Count && steps[i].Level == option.Level)
+                {
+                    adjust = Then(adjust, steps[i].Adjust);
+                    i++;
+                }
+                if (option.Level == Level.Brightness)
+                    Guard(runner, "Brightness", delegate { runner.Lines.AddRange(Brightness.Change(adjust)); });
+                else
+                    Guard(runner, "Volume", delegate { runner.Lines.Add(Volume.Change(adjust)); });
+            }
+            return runner;
+        }
+
+        // The current state, shown when the window opens
+        public static Runner Describe()
+        {
+            var runner = new Runner { InWindow = true };
+            Guard(runner, "Brightness", delegate { runner.Lines.AddRange(Brightness.Change(x => x)); });
+            Guard(runner, "Volume", delegate { runner.Lines.Add(Volume.Describe()); });
+            Guard(runner, "Dark mode", delegate { runner.Lines.Add(Theme.Describe()); });
+            runner.Lines.Add(Power.DescribeKeepAwake());
+            return runner;
+        }
+
+        static Func<int, int> Then(Func<int, int> first, Func<int, int> next)
+        {
+            return x => Percent.Clamp(next(first(x)));
+        }
+
+        // One option failing never stops the others
+        static void Guard(Runner runner, string name, Action step)
+        {
+            try
+            {
+                step();
+            }
+            catch (Problem e)
+            {
+                runner.Failed = true;
+                runner.Lines.Add(name + ": " + e.Message);
+            }
+            catch (Exception e)
+            {
+                runner.Failed = true;
+                runner.Lines.Add(name + ": did not work (" + e.Message.Trim() + ")");
+            }
         }
     }
 
@@ -105,18 +281,18 @@ namespace DigitControl
             public bool Refused;
         }
 
-        // Moves every screen that allows it by delta percent, each from its own
-        // current level, and returns one line per screen. A delta of 0 only reads.
-        public static List<string> Change(int delta)
+        // Sets every screen that allows it to adjust(its own current level)
+        // and returns one line per screen
+        public static List<string> Change(Func<int, int> adjust)
         {
             var screens = new List<Screen>();
-            ChangeBuiltIn(delta, screens);
-            ChangeExternal(delta, screens);
+            ChangeBuiltIn(adjust, screens);
+            ChangeExternal(adjust, screens);
+            if (screens.Count == 0)
+                throw new Problem("no screen here lets software change it. External monitors need " +
+                                  "DDC/CI turned on in their own menu.");
 
             var lines = new List<string>();
-            if (screens.Count == 0)
-                lines.Add("Brightness: no screen here lets software change it. External " +
-                          "monitors need DDC/CI turned on in their own menu.");
             foreach (Screen screen in screens)
             {
                 string label = screens.Count == 1 ? "Brightness" : "Brightness, " + screen.Name;
@@ -127,7 +303,7 @@ namespace DigitControl
             return lines;
         }
 
-        static void ChangeBuiltIn(int delta, List<Screen> screens)
+        static void ChangeBuiltIn(Func<int, int> adjust, List<Screen> screens)
         {
             var current = new Dictionary<string, int>();
             try
@@ -143,7 +319,7 @@ namespace DigitControl
                     {
                         int before;
                         if (!current.TryGetValue((string)screen["InstanceName"], out before)) continue;
-                        var result = new Screen { Name = "built-in screen", Before = before, After = Percent.Clamp(before + delta) };
+                        var result = new Screen { Name = "built-in screen", Before = before, After = Percent.Clamp(adjust(before)) };
                         try
                         {
                             if (result.After != before)
@@ -166,7 +342,7 @@ namespace DigitControl
             }
         }
 
-        static void ChangeExternal(int delta, List<Screen> screens)
+        static void ChangeExternal(Func<int, int> adjust, List<Screen> screens)
         {
             var handles = new List<IntPtr>();
             EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero,
@@ -186,7 +362,7 @@ namespace DigitControl
                     {
                         uint min, cur, max;
                         // Fails for laptop screens and for monitors without DDC/CI
-                        if (!GetMonitorBrightness(monitor.hPhysicalMonitor, out min, out cur, out max) || max <= min)
+                        if (!GetMonitorBrightness(monitor.hPhysicalMonitor, out min, out cur, out max) || max <= min || cur < min)
                             continue;
 
                         number++;
@@ -195,7 +371,7 @@ namespace DigitControl
                             name += " (" + monitor.szPhysicalMonitorDescription + ")";
 
                         int before = (int)Math.Round((cur - min) * 100.0 / (max - min));
-                        var result = new Screen { Name = name, Before = before, After = Percent.Clamp(before + delta) };
+                        var result = new Screen { Name = name, Before = before, After = Percent.Clamp(adjust(before)) };
                         uint raw = min + (uint)Math.Round(result.After * (max - min) / 100.0);
                         if (result.After != before && !SetMonitorBrightness(monitor.hPhysicalMonitor, raw))
                             result.Refused = true;
@@ -238,11 +414,46 @@ namespace DigitControl
         static extern bool SetMonitorBrightness(IntPtr hMonitor, uint brightness);
     }
 
-    // Volume and mute of the default speakers or headphones, through Windows'
-    // Core Audio API
+    // Volume and mute of the default speakers or headphones (the ones the
+    // taskbar volume icon controls), through Windows' Core Audio API
     static class Volume
     {
-        public static string Change(int delta, bool toggleMute)
+        public static string Change(Func<int, int> adjust)
+        {
+            return WithSpeakers(delegate(IAudioEndpointVolume speakers)
+            {
+                var context = Guid.Empty;
+                float level;
+                speakers.GetMasterVolumeLevelScalar(out level);
+                int before = (int)Math.Round(level * 100);
+                int after = Percent.Clamp(adjust(before));
+                if (after != before) speakers.SetMasterVolumeLevelScalar(after / 100f, ref context);
+                bool muted;
+                speakers.GetMute(out muted);
+                return "Volume: " + Percent.Levels(before, after) + (muted ? " (muted)" : "");
+            });
+        }
+
+        // true mutes, false unmutes, null switches
+        public static string SetMute(bool? mute)
+        {
+            return WithSpeakers(delegate(IAudioEndpointVolume speakers)
+            {
+                var context = Guid.Empty;
+                bool muted;
+                speakers.GetMute(out muted);
+                bool want = mute.HasValue ? mute.Value : !muted;
+                if (want != muted) speakers.SetMute(want, ref context);
+                return want ? "Sound: muted" : "Sound: on";
+            });
+        }
+
+        public static string Describe()
+        {
+            return Change(x => x);
+        }
+
+        static string WithSpeakers(Func<IAudioEndpointVolume, string> use)
         {
             IAudioEndpointVolume speakers;
             try
@@ -251,29 +462,11 @@ namespace DigitControl
             }
             catch (COMException)
             {
-                return "Volume: no speakers or headphones found.";
+                throw new Problem("no speakers or headphones found.");
             }
-
             try
             {
-                var context = Guid.Empty;
-                float level;
-                speakers.GetMasterVolumeLevelScalar(out level);
-                int before = (int)Math.Round(level * 100);
-                int after = Percent.Clamp(before + delta);
-                if (after != before) speakers.SetMasterVolumeLevelScalar(after / 100f, ref context);
-
-                bool muted;
-                speakers.GetMute(out muted);
-                if (toggleMute)
-                {
-                    muted = !muted;
-                    speakers.SetMute(muted, ref context);
-                }
-
-                string line = "Volume: " + Percent.Levels(before, after);
-                if (toggleMute) return line + (muted ? ", now muted" : ", now unmuted");
-                return muted ? line + " (muted)" : line;
+                return use(speakers);
             }
             finally
             {
@@ -340,19 +533,23 @@ namespace DigitControl
         }
     }
 
+    // Presses the keyboard's media keys, which whatever is playing (Spotify,
+    // a browser tab, Media Player) answers
     static class Media
     {
-        const byte VK_MEDIA_PLAY_PAUSE = 0xB3;
+        public const byte Next = 0xB0;
+        public const byte Previous = 0xB1;
+        public const byte Stop = 0xB2;
+        public const byte PlayPause = 0xB3;
+
         const uint KEYEVENTF_EXTENDEDKEY = 0x1;
         const uint KEYEVENTF_KEYUP = 0x2;
 
-        // Presses the keyboard's play / pause media key, which whatever is
-        // playing (Spotify, a browser tab, Media Player) answers
-        public static string PlayPause()
+        public static string Press(byte key, string name)
         {
-            keybd_event(VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY, UIntPtr.Zero);
-            keybd_event(VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, UIntPtr.Zero);
-            return "Play / pause: pressed";
+            keybd_event(key, 0, KEYEVENTF_EXTENDEDKEY, UIntPtr.Zero);
+            keybd_event(key, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, UIntPtr.Zero);
+            return name + ": pressed";
         }
 
         [DllImport("user32.dll")]
@@ -371,7 +568,12 @@ namespace DigitControl
 
         public static string Toggle()
         {
-            int light = IsDark() ? 1 : 0;
+            return Set(!IsDark());
+        }
+
+        public static string Set(bool dark)
+        {
+            int light = dark ? 0 : 1;
             using (RegistryKey key = Registry.CurrentUser.CreateSubKey(Personalize))
             {
                 key.SetValue("AppsUseLightTheme", light, RegistryValueKind.DWord);
@@ -402,18 +604,46 @@ namespace DigitControl
                                                 uint flags, uint timeout, out IntPtr result);
     }
 
+    static class Desktop
+    {
+        // The same as Windows + D: hides every window, or brings them back
+        public static string Toggle()
+        {
+            Type shellType = Type.GetTypeFromProgID("Shell.Application");
+            object shell = Activator.CreateInstance(shellType);
+            try
+            {
+                shellType.InvokeMember("ToggleDesktop", BindingFlags.InvokeMethod, null, shell, null);
+            }
+            finally
+            {
+                Marshal.ReleaseComObject(shell);
+            }
+            return "Show desktop / restore: done";
+        }
+    }
+
+    static class Apps
+    {
+        public static string Open(string target, string name)
+        {
+            Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+            return "Opened " + name;
+        }
+    }
+
     static class Power
     {
         public static bool KeepingAwake { get; private set; }
 
-        // Stops Windows sleeping or turning the screen off, for as long as
-        // this window is open
-        public static string ToggleKeepAwake()
+        // Stops Windows sleeping or turning the screen off for as long as
+        // the window stays open
+        public static string KeepAwake(Runner runner, bool on)
         {
-            KeepingAwake = !KeepingAwake;
-            SetThreadExecutionState(KeepingAwake
-                ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
-                : ES_CONTINUOUS);
+            if (!runner.InWindow)
+                throw new Problem("only works while the window is open. Run DigitControl.exe without codes, then type 51.");
+            KeepingAwake = on;
+            SetThreadExecutionState(on ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED : ES_CONTINUOUS);
             return DescribeKeepAwake();
         }
 
@@ -422,14 +652,35 @@ namespace DigitControl
             return KeepingAwake ? "Keep awake: on while this window is open" : "Keep awake: off";
         }
 
-        public static void Lock()
+        public static string Lock()
         {
-            LockWorkStation();
+            if (!LockWorkStation()) throw new Problem("Windows refused to lock.");
+            return "Locking the PC";
         }
 
-        public static void ScreenOff(IntPtr window)
+        public static string ScreenOff(Runner runner)
         {
-            SendMessage(window, WM_SYSCOMMAND, new IntPtr(SC_MONITORPOWER), new IntPtr(2));
+            runner.Later.Add(delegate
+            {
+                // A hidden window of our own to send the request through
+                var window = new NativeWindow();
+                window.CreateHandle(new CreateParams());
+                try
+                {
+                    SendMessage(window.Handle, WM_SYSCOMMAND, new IntPtr(SC_MONITORPOWER), new IntPtr(2));
+                }
+                finally
+                {
+                    window.DestroyHandle();
+                }
+            });
+            return "Turning the screen off. Move the mouse or press a key to wake it.";
+        }
+
+        public static string Sleep(Runner runner)
+        {
+            runner.Later.Add(delegate { Application.SetSuspendState(PowerState.Suspend, false, false); });
+            return "Going to sleep";
         }
 
         const uint ES_CONTINUOUS = 0x80000000;
@@ -451,25 +702,32 @@ namespace DigitControl
     class MainForm : Form
     {
         const string Title = "Digit Control";
+        const int HotkeyId = 1;
 
-        readonly TextBox input = new TextBox();
+        readonly TextBox input = new TextBox { Name = "input" };
         readonly Label status = new Label();
-
-        // The screen goes off a moment after Enter, so letting go of the key
-        // does not wake it straight back up
-        readonly Timer screenOffDelay = new Timer { Interval = 1000 };
+        readonly Label hint = new Label();
+        readonly Timer later = new Timer { Interval = 1000 };
+        readonly List<Action> pending = new List<Action>();
 
         public MainForm()
         {
             Text = Title;
             Font = SystemFonts.MessageBoxFont;
             AutoScaleMode = AutoScaleMode.Font;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
+            FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
             AutoSize = true;
             AutoSizeMode = AutoSizeMode.GrowAndShrink;
             KeyPreview = true;
+            try
+            {
+                Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            }
+            catch (Exception)
+            {
+            }
 
             var layout = new FlowLayoutPanel
             {
@@ -477,152 +735,147 @@ namespace DigitControl
                 WrapContents = false,
                 AutoSize = true,
                 AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                Padding = new Padding(12),
+                Padding = new Padding(14),
             };
 
             layout.Controls.Add(new Label
             {
-                Text = "Type digits, then press Enter. Each digit is one option:",
+                Text = "Type codes and press Enter, like 11 11 21 or 11x5. Click an option to run it now.",
                 AutoSize = true,
-                Margin = new Padding(0, 0, 0, 6),
+                Margin = new Padding(0, 0, 0, 8),
             });
 
-            var table = new TableLayoutPanel { ColumnCount = 4, AutoSize = true, Margin = new Padding(0) };
-            foreach (Option option in Options.All)
-            {
-                table.Controls.Add(new Label
-                {
-                    Text = option.Key.ToString(),
-                    Font = new Font(Font, FontStyle.Bold),
-                    AutoSize = true,
-                    Margin = new Padding(8, 3, 8, 3),
-                });
-                table.Controls.Add(new Label { Text = option.Description, AutoSize = true, Margin = new Padding(0, 3, 16, 3) });
-            }
-            layout.Controls.Add(table);
-
-            layout.Controls.Add(new Label
-            {
-                Text = "Steps add up: 111 is +3%. On / off options flip each time: 44 changes nothing.",
-                AutoSize = true,
-                ForeColor = SystemColors.GrayText,
-                Margin = new Padding(0, 6, 0, 0),
-            });
+            var groups = new TableLayoutPanel { ColumnCount = 3, AutoSize = true, Margin = new Padding(0) };
+            foreach (string group in Options.Groups)
+                groups.Controls.Add(GroupPanel(group));
+            layout.Controls.Add(groups);
 
             var row = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 12, 0, 0) };
-            input.Width = 300;
+            input.Width = 360;
             input.Margin = new Padding(0, 1, 8, 0);
             row.Controls.Add(input);
             var apply = new Button { Text = "Apply", AutoSize = true, Margin = new Padding(0) };
-            apply.Click += delegate { ApplyInput(); };
+            apply.Click += delegate { RunInput(); };
             row.Controls.Add(apply);
             layout.Controls.Add(row);
 
             status.AutoSize = true;
-            status.MaximumSize = new Size(520, 0);
+            status.MaximumSize = new Size(600, 0);
             status.Margin = new Padding(0, 12, 0, 0);
             layout.Controls.Add(status);
+
+            hint.AutoSize = true;
+            hint.ForeColor = SystemColors.GrayText;
+            hint.Margin = new Padding(0, 12, 0, 0);
+            layout.Controls.Add(hint);
 
             Controls.Add(layout);
             AcceptButton = apply;
 
-            screenOffDelay.Tick += delegate
+            later.Tick += delegate
             {
-                screenOffDelay.Stop();
-                Power.ScreenOff(Handle);
+                later.Stop();
+                var actions = new List<Action>(pending);
+                pending.Clear();
+                foreach (Action action in actions)
+                {
+                    try { action(); }
+                    catch (Exception e) { ShowError(e.Message); }
+                }
             };
-            KeyDown += delegate(object sender, KeyEventArgs e) { if (e.KeyCode == Keys.Escape) Close(); };
+            KeyDown += delegate(object sender, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Escape) WindowState = FormWindowState.Minimized;
+            };
             Shown += delegate
             {
-                ShowLines(Apply(new Changes(), true));
+                ShowResult(Engine.Describe());
                 input.Focus();
             };
         }
 
-        void ApplyInput()
+        Control GroupPanel(string group)
         {
-            var changes = new Changes();
-            var unknown = new List<string>();
-            foreach (char c in input.Text)
+            var panel = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Margin = new Padding(0, 0, 24, 10) };
+            var header = new Label
             {
-                if (char.IsWhiteSpace(c)) continue;
-                Option option = Options.Find(c);
-                if (option == null)
+                Text = group,
+                Font = new Font(Font, FontStyle.Bold),
+                AutoSize = true,
+                Margin = new Padding(0, 0, 0, 4),
+            };
+            panel.Controls.Add(header);
+            panel.SetColumnSpan(header, 2);
+
+            foreach (Option option in Options.All)
+            {
+                if (option.Group != group) continue;
+                panel.Controls.Add(new Label
                 {
-                    if (!unknown.Contains(c.ToString())) unknown.Add(c.ToString());
-                    continue;
-                }
-                option.Apply(changes);
+                    Text = option.Code.ToString(),
+                    Font = new Font(FontFamily.GenericMonospace, Font.Size, FontStyle.Bold),
+                    AutoSize = true,
+                    Margin = new Padding(0, 2, 8, 2),
+                });
+                var link = new LinkLabel
+                {
+                    Text = option.Description,
+                    AutoSize = true,
+                    LinkBehavior = LinkBehavior.HoverUnderline,
+                    LinkColor = SystemColors.ControlText,
+                    ActiveLinkColor = SystemColors.HotTrack,
+                    Margin = new Padding(0, 2, 0, 2),
+                };
+                Option chosen = option;
+                link.LinkClicked += delegate
+                {
+                    input.Text = chosen.Code.ToString();
+                    Run(new List<Option> { chosen });
+                    input.Focus();
+                    input.SelectAll();
+                };
+                panel.Controls.Add(link);
             }
+            return panel;
+        }
 
-            if (unknown.Count > 0)
-                ShowError("Not an option: " + string.Join(" ", unknown) + ". Use only the digits 0 to 9. Nothing was changed.");
-            else if (input.Text.Trim().Length == 0)
-                ShowError("Type at least one digit first.");
-            else
-                ShowLines(Apply(changes, false));
+        void RunInput()
+        {
+            string error;
+            List<Option> steps = Parser.Parse(input.Text, out error);
+            if (steps == null) ShowError(error);
+            else Run(steps);
 
-            // Selected, so Enter applies the same digits again and typing replaces them
+            // Selected, so Enter runs the same codes again and typing replaces them
             input.SelectAll();
             input.Focus();
         }
 
-        // Carries out the changes and returns one line for each thing touched.
-        // With everything set it also lists the current state of what was not
-        // touched; that is the view the window opens with.
-        List<string> Apply(Changes c, bool everything)
+        void Run(List<Option> steps)
         {
-            var lines = new List<string>();
             Cursor = Cursors.WaitCursor;
             try
             {
-                if (everything || c.BrightnessDelta != 0)
-                    Run(lines, "Brightness", delegate { lines.AddRange(Brightness.Change(c.BrightnessDelta)); });
-                if (everything || c.VolumeDelta != 0 || c.ToggleMute)
-                    Run(lines, "Volume", delegate { lines.Add(Volume.Change(c.VolumeDelta, c.ToggleMute)); });
-                if (c.PlayPause)
-                    Run(lines, "Play / pause", delegate { lines.Add(Media.PlayPause()); });
-                if (everything || c.ToggleDarkMode)
-                    Run(lines, "Dark mode", delegate { lines.Add(c.ToggleDarkMode ? Theme.Toggle() : Theme.Describe()); });
-                if (everything || c.ToggleKeepAwake)
-                    lines.Add(c.ToggleKeepAwake ? Power.ToggleKeepAwake() : Power.DescribeKeepAwake());
-                if (c.Lock)
+                Runner runner = Engine.Run(steps, true);
+                ShowResult(runner);
+                if (runner.Later.Count > 0)
                 {
-                    Power.Lock();
-                    lines.Add("Locking the PC");
-                }
-                if (c.ScreenOff)
-                {
-                    screenOffDelay.Start();
-                    lines.Add("Turning the screen off. Move the mouse or press a key to wake it.");
+                    pending.AddRange(runner.Later);
+                    later.Stop();
+                    later.Start();
                 }
             }
             finally
             {
                 Cursor = Cursors.Default;
             }
-
-            Text = Power.KeepingAwake ? Title + " (keeping awake)" : Title;
-            return lines;
         }
 
-        // One option failing never stops the others
-        static void Run(List<string> lines, string name, Action step)
-        {
-            try
-            {
-                step();
-            }
-            catch (Exception e)
-            {
-                lines.Add(name + ": did not work (" + e.Message.Trim() + ")");
-            }
-        }
-
-        void ShowLines(List<string> lines)
+        void ShowResult(Runner runner)
         {
             status.ForeColor = SystemColors.ControlText;
-            status.Text = string.Join(Environment.NewLine, lines);
+            status.Text = string.Join(Environment.NewLine, runner.Lines);
+            Text = Power.KeepingAwake ? Title + " (keeping awake)" : Title;
         }
 
         void ShowError(string message)
@@ -630,21 +883,121 @@ namespace DigitControl
             status.ForeColor = Color.Firebrick;
             status.Text = message;
         }
+
+        // Ctrl+Alt+D brings the window back from anywhere
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            bool registered = RegisterHotKey(Handle, HotkeyId, MOD_ALT | MOD_CONTROL | MOD_NOREPEAT, (uint)Keys.D);
+            hint.Text = registered
+                ? "Ctrl+Alt+D brings this window back from anywhere. Esc minimizes it."
+                : "Esc minimizes this window. (Ctrl+Alt+D is taken by another app.)";
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            UnregisterHotKey(Handle, HotkeyId);
+            base.OnHandleDestroyed(e);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HotkeyId)
+            {
+                if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+                Activate();
+                input.Focus();
+                input.SelectAll();
+            }
+            base.WndProc(ref m);
+        }
+
+        const int WM_HOTKEY = 0x0312;
+        const uint MOD_ALT = 0x1;
+        const uint MOD_CONTROL = 0x2;
+        const uint MOD_NOREPEAT = 0x4000;
+
+        [DllImport("user32.dll")]
+        static extern bool RegisterHotKey(IntPtr hWnd, int id, uint modifiers, uint vk);
+
+        [DllImport("user32.dll")]
+        static extern bool UnregisterHotKey(IntPtr hWnd, int id);
     }
 
     static class Program
     {
-        [DllImport("user32.dll")]
-        static extern bool SetProcessDPIAware();
-
         [STAThread]
-        static void Main()
+        static int Main(string[] args)
         {
+            if (args.Length > 0) return CommandLine(args);
+
             // Sharp text on scaled (high-DPI) screens
             if (Environment.OSVersion.Version.Major >= 6) SetProcessDPIAware();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
+            return 0;
         }
+
+        // DigitControl.exe 11x5 21 runs the codes without opening the window.
+        // Exit code 0: all done, 1: something did not work, 2: bad codes.
+        static int CommandLine(string[] args)
+        {
+            // A window app has no console of its own; borrow the one it was
+            // started from, unless its output is already going to a file or pipe
+            if (GetStdHandle(STD_OUTPUT_HANDLE) == IntPtr.Zero) AttachConsole(ATTACH_PARENT_PROCESS);
+            Console.WriteLine();
+
+            string first = args[0].ToLowerInvariant();
+            if (first == "--list" || first == "--help" || first == "-h" || first == "/?")
+            {
+                Console.WriteLine("Digit Control: run Windows options by number.");
+                Console.WriteLine();
+                Console.WriteLine("  DigitControl.exe             open the window");
+                Console.WriteLine("  DigitControl.exe 11x5 21     brightness up 5%, then volume up 1%");
+                Console.WriteLine("  DigitControl.exe --list      this list");
+                foreach (string group in Options.Groups)
+                {
+                    Console.WriteLine();
+                    Console.WriteLine(group);
+                    foreach (Option option in Options.All)
+                        if (option.Group == group) Console.WriteLine("  " + option.Code + "  " + option.Description);
+                }
+                return 0;
+            }
+
+            string error;
+            List<Option> steps = Parser.Parse(string.Join(" ", args), out error);
+            if (steps == null)
+            {
+                Console.WriteLine(error);
+                return 2;
+            }
+
+            Runner runner = Engine.Run(steps, false);
+            foreach (string line in runner.Lines) Console.WriteLine(line);
+            if (runner.Later.Count > 0)
+            {
+                System.Threading.Thread.Sleep(1000);
+                foreach (Action action in runner.Later)
+                {
+                    try { action(); }
+                    catch (Exception e) { Console.WriteLine(e.Message); runner.Failed = true; }
+                }
+            }
+            return runner.Failed ? 1 : 0;
+        }
+
+        const int STD_OUTPUT_HANDLE = -11;
+        const int ATTACH_PARENT_PROCESS = -1;
+
+        [DllImport("user32.dll")]
+        static extern bool SetProcessDPIAware();
+
+        [DllImport("kernel32.dll")]
+        static extern bool AttachConsole(int processId);
+
+        [DllImport("kernel32.dll")]
+        static extern IntPtr GetStdHandle(int handle);
     }
 }

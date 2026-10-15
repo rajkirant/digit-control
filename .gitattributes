@@ -1,2 +1,5 @@
 # Windows batch files run under cmd, which wants CRLF
 *.bat text eol=crlf
+
+# The icon is binary
+*.ico binary
